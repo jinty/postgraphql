@@ -58,6 +58,49 @@ const origGraphiqlHtml = new Promise((resolve, reject) => {
   })
 })
 
+function makeAuthenticator(options) {
+    async function authenticate (req, res) {
+        // Authenticate the client
+        //
+        // async as maybe we need to talk to some service to authenticate
+        // also allow the response in as we may want to send a header to the client
+        // with a renewed token (or respond with a 403)
+        const jwtToken = getJwtToken(req)
+        // wave hands vigorously to authenticate the jwt token (parsing
+        // code from setupPgClientTransaction) and return an object of
+        // "settings" to set in postgresql
+        return {
+            pgRole: pgRole,
+            claims: jwt_claims
+        }
+    }
+    return authentciate;
+}
+
+function makeExecutor(options) {
+    var pgPool = options.pgPool;
+    async function execute(req, auth_context, schema, documentAST, rootValue, contextValue, variableValues, operationName) {
+        // this function is basically a hook allowing overriding of the connection management
+        const result;
+        result = await withPostGraphQLContext({
+                pgPool,
+                auth_context,
+                pgDefaultRole: options.pgDefaultRole,
+            },
+            context => {
+                return executeGraphql(
+                    schema,
+                    documentAST,
+                    rootValue,
+                    contextValue,
+                    variableValues,
+                    operationName)
+            })
+        return result;
+    }
+    return execute;
+}
+
 /**
  * Creates a GraphQL request handler, this is untyped besides some JSDoc types
  * for intellisense.
@@ -65,7 +108,7 @@ const origGraphiqlHtml = new Promise((resolve, reject) => {
  * @param {GraphQLSchema} graphqlSchema
  */
 export default function createPostGraphQLHttpRequestHandler (options) {
-  const { getGqlSchema, pgPool } = options
+  const { getGqlSchema } = options
 
   // Gets the route names for our GraphQL endpoint, and our GraphiQL endpoint.
   const graphqlRoute = options.graphqlRoute || '/graphql'
@@ -109,6 +152,8 @@ export default function createPostGraphQLHttpRequestHandler (options) {
     `window.POSTGRAPHQL_CONFIG={graphqlUrl:'${graphqlRoute}',streamUrl:${options.watchPg ? '\'/_postgraphql/stream\'' : 'null'}}`,
   ))
 
+  const executor = makeExecutor(options);
+  const authenticator = makeAuthenticator(options);
   /**
    * The actual request handler. It’s an async function so it will return a
    * promise when complete. If the function doesn’t handle anything, it calls
@@ -383,24 +428,16 @@ export default function createPostGraphQLHttpRequestHandler (options) {
       if (debugGraphql.enabled)
         debugGraphql(printGraphql(queryDocumentAst).replace(/\s+/g, ' ').trim())
 
-      const jwtToken = getJwtToken(req)
-
-      result = await withPostGraphQLContext({
-        pgPool,
-        jwtToken,
-        jwtSecret: options.jwtSecret,
-        pgDefaultRole: options.pgDefaultRole,
-      }, context => {
-        pgRole = context.pgRole
-        return executeGraphql(
-          gqlSchema,
-          queryDocumentAst,
-          null,
-          context,
-          params.variables,
-          params.operationName,
-        )
-      })
+      const auth_context = authenticate(req, res)
+      result = await executor(
+                    req, 
+                    auth_context,
+                    gqlSchema,
+                    queryDocumentAst,
+                    null,
+                    context,
+                    params.variables,
+                    params.operationName)
     }
     catch (error) {
       // Set our status code and send the client our results!
@@ -433,7 +470,7 @@ export default function createPostGraphQLHttpRequestHandler (options) {
 
         // If we have enabled the query log for the Http handler, use that.
         // tslint:disable-next-line no-console
-        console.log(`${chalk[errorCount === 0 ? 'green' : 'red'](`${errorCount} error(s)`)} ${pgRole != null ? `as ${chalk.magenta(pgRole)} ` : ''}in ${chalk.grey(`${ms}ms`)} :: ${prettyQuery}`)
+        console.log(`${chalk[errorCount === 0 ? 'green' : 'red'](`${errorCount} error(s)`)} ${auth_context.pgRole != null ? `as ${chalk.magenta(pgRole)} ` : ''}in ${chalk.grey(`${ms}ms`)} :: ${prettyQuery}`)
       }
     }
   }
